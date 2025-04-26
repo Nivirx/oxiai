@@ -147,11 +147,11 @@ async fn main() -> anyhow::Result<()> {
 
                         match args.stream {
                             true => {
-                                stream_ollama_response(&mut app, client.clone(), args.model.clone(), prompt, req)
+                                stream_ollama_response(&mut app, client.clone(), req)
                                     .await?;
                             }
                             false => {
-                                ollama_response(&mut app, client.clone(), args.model.clone(), prompt, req)
+                                ollama_response(&mut app, client.clone(), req)
                                     .await?;
                             }
                         }
@@ -178,8 +178,6 @@ async fn main() -> anyhow::Result<()> {
 async fn stream_ollama_response(
     app: &mut App,
     client: Client,
-    model: String,
-    user_prompt: String,
     req: ChatRequest<'_>,
 ) -> anyhow::Result<()> {
     app.waiting = true;
@@ -215,8 +213,6 @@ async fn stream_ollama_response(
 async fn ollama_response<'a>(
     app: &mut App,
     client: Client,
-    model: String,
-    user_prompt: String,
     req: ChatRequest<'a>,
 ) -> anyhow::Result<()> {
 

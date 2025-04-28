@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::new();
 
     let header_prompt =
-        r#"SYSTEM: You are "OxiAI", a logical, personal assistant that answers *only* via JSON"#;
+        r#"SYSTEM: You are "OxiAI", a logical, personal assistant that answers *only* via valid, minified, UTF-8 JSON."#;
 
     let tools_list = include_str!("tool/tools_list.json")
         .parse::<serde_json::Value>()?
@@ -92,8 +92,7 @@ async fn main() -> anyhow::Result<()> {
 4. If a question is vague, comparative, descriptive, or about ideas rather than specifics: use the web_search tool.
 5. If a question clearly names a specific object, animal, person, place: use the wiki_search tool.
 6. Base claims strictly on provided data or tool results. If unsure, say so.
-7. Perform a JSON Self-check to ensure valid, minified, UTF-8 JSON.
-8. Finish with a coherent sentence; if you reach four consecutive newlines: **STOP.**"#;
+7. Check your output; If you reach four consecutive newlines: *stop*"#;
 
     let example_prompt = format!(
         "Example 1:{user_q_1}\n{assistant_tool_request_1}\n{tool_result_1}\n{assistant_a_1}",

@@ -1,0 +1,49 @@
+{
+    "tools": [
+        {
+            "type": "function",
+            "function": {
+                "name": "wiki_search",
+                "description": "Search Wikipedia",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search term to request"
+                        }
+                    }
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search DuckDuckGo (a web search engine)",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search term to request"
+                        }
+                    }
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_datetime_iso8601",
+                "description": "Get the current date and time in iso8601 format to the seconds",
+                "parameters": {
+                    "type": "None"
+                },
+                "required": []
+            }
+        }
+    ]
+}

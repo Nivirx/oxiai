@@ -1,5 +1,5 @@
 use serde::de::{self, Deserializer as DeDeserializer, IntoDeserializer, Visitor};
-use serde::{Deserialize, Serialize, Serializer, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use std::borrow::Cow;
 use std::collections::HashMap;

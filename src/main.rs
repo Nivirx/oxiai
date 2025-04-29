@@ -1,3 +1,14 @@
+use tokio::{sync::mpsc, task};
+
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, EventStream, Event as CEvent, KeyCode,
+};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+
+use ratatui::{Frame, Terminal, backend::CrosstermBackend};
+
 use std::borrow::Cow;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -7,12 +18,7 @@ use clap::Parser;
 use futures_util::StreamExt;
 use reqwest::Client;
 
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode};
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-
-use ratatui::{Terminal, backend::CrosstermBackend};
+use futures_util::stream::StreamExt;
 
 mod chat;
 mod ui;
@@ -38,11 +44,21 @@ struct Args {
     nerd_stats: bool,
 }
 
-struct App {
+struct AppState {
     args: Args,
     prompt: String,
     messages: Vec<Message>,
     waiting: bool,
+}
+
+impl AppState {
+    
+}
+
+/// Messages that can arrive in the UI loop
+enum Msg {
+    Input(CEvent),
+    HttpDone(Result<String, reqwest::Error>),
 }
 
 #[tokio::main]
@@ -56,21 +72,35 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // setup crossterm
-    enable_raw_mode()?;
+    // channel capacity 100 is plenty for a TUI
+    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+
+    // --- Kick off an HTTP worker as a proof-of-concept ----
+    {
+        let tx = tx.clone();
+
+        tokio::spawn(async move {
+
+            let res: Result<String, reqwest::Error> = async {
+                let resp = reqwest::get("https://ifconfig.me/all.json").await?;
+                resp.text().await
+            }.await;
+            let _ = tx.send(Msg::HttpDone(res));
+
+        });
+    }
+
+    // ---- UI LOOP ----------------------------------------------------------
+    enable_raw_mode()?; // crossterm
     let mut stdout_handle = std::io::stdout();
     crossterm::execute!(stdout_handle, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout_handle);
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
-    let mut app = App {
-        args,
-        prompt: String::new(),
-        messages: vec![],
-        waiting: false,
-    };
-
-    let client = Client::new();
+    let mut events = EventStream::new();
+    // fixed-rate tick for animations
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(33));
 
     let header_prompt = r#"SYSTEM: You are "OxiAI", a logical, personal assistant that answers *only* via valid, minified, UTF-8 JSON."#;
 
@@ -87,89 +117,50 @@ async fn main() -> anyhow::Result<()> {
 6. Base claims strictly on provided data or tool results. If unsure, say so.
 7. Check your output; If you reach four consecutive newlines: *stop*"#;
 
-    //let user_info_prompt = r#""#;
     let system_prompt = format!(
         "{header_prompt}\n
         {tools_list}\n\n
         {rules_prompt}\n"
     );
 
+    let mut state = AppState  {
+        args,
+        prompt: String::new(),
+        messages: vec![],
+        waiting: false,
+    };
+
     loop {
-        terminal.draw(|f| ui::chat_ui(f, &app))?;
-
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char(c) => app.prompt.push(c),
-                    KeyCode::Backspace => {
-                        app.prompt.pop();
+        // first – non-blocking drain of all pending messages
+        while let Ok(Some(msg)) = rx.try_recv() {
+            match msg {
+                Msg::Input(ev) => {
+                    if matches!(ev, CEvent::Key(k) if k.code == KeyCode::Char('q')) {
+                        cleanup(&mut terminal)?;
+                        return Ok(());
                     }
-                    KeyCode::Enter => {
-                        //TODO: refactor to a parser function to take the contents of the app.prompt vec and do fancy stuff with it (like commands)
-                        let message_args = args_builder! {
-                            "response" => app.prompt.clone(),
-                        };
-                        app.prompt.clear();
+                    state.handle_input(ev);
+                }
+                Msg::HttpDone(r) => state.handle_http(r),
+            }
+        }
 
-                        app.messages.push(chat::Message::new(
-                            chat::MessageRoles::User,
-                            chat::Action::Chat,
-                            message_args,
-                        ));
+        // draw a new frame
+        terminal.draw(|f| ui::chat_ui(f, &state))?;
 
-                        let mut prompts = vec![chat::Prompt {
-                            role: Cow::Borrowed("system"),
-                            content: Cow::Borrowed(&system_prompt),
-                        }];
-                        prompts.extend(
-                            app.messages
-                                .iter()
-                                .map(|msg| chat::Prompt::from(msg.clone())),
-                        );
+        // block until either next tick or next user input
+        tokio::select! {
+            _ = ticker.tick() => { /* redraw ui per tick rate */},
 
-                        let req = chat::ChatRequest {
-                            model: &app.args.model.clone(),
-                            stream: app.args.stream,
-                            format: "json",
-                            stop: vec!["\n\n\n\n"],
-                            options: Some(chat::ChatOptions {
-                                temperature: Some(0.3),
-                                top_p: Some(0.92),
-                                top_k: Some(50),
-                                repeat_penalty: Some(1.1),
-                                seed: None,
-                            }),
-                            messages: prompts,
-                        };
+            maybe_ev = events.next() => {
+                if let Some(Ok(ev)) = maybe_ev {
+                    if tx.send(Msg::Input(ev)).is_err() { break }
 
-                        app.waiting = true;
-                        match app.args.stream {
-                            true => {
-                                todo!();
-                                stream_ollama_response(&mut app, client.clone(), req).await?;
-                            }
-                            false => {
-                                batch_ollama_response(&mut app, client.clone(), req).await?;
-                            }
-                        }
-                    }
-                    KeyCode::Esc => {
-                        break;
-                    }
-                    _ => {}
+                    
                 }
             }
         }
     }
-
-    disable_raw_mode()?;
-    crossterm::execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-    Ok(())
 }
 
 //FIXME: streaming replies are harder to work with for now, save this for the future

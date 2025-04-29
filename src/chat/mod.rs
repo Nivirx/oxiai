@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
-use serde::de::{self, Deserializer};
+use serde::de::{self, Deserializer as DeDeserializer, IntoDeserializer, Visitor};
+use serde::{Deserialize, Serialize, Serializer, Deserializer};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -65,7 +65,7 @@ impl Display for MessageRoles {
             MessageRoles::Tool => "tool",
             MessageRoles::User => "user",
             MessageRoles::Assistant => "assistant",
-            //HACK: Handle this cleanly, if the model hallucinates we crash :^)
+            //HACK: Handle this cleanly, if the model hallucinates a role we crash :^)
             MessageRoles::Other => todo!(),
         };
 
@@ -91,7 +91,7 @@ impl Message {
     // Custom deserializer function
     fn de_content<'de, D>(deserializer: D) -> Result<ActionPacket, D::Error>
     where
-        D: Deserializer<'de>,
+        D: DeDeserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         serde_json::from_str(&s).map_err(de::Error::custom)
@@ -110,7 +110,9 @@ impl Display for Message {
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq)]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
 pub enum AssistantTool {
     WikiSearch,
     WebSearch,
@@ -125,26 +127,26 @@ impl Display for AssistantTool {
         let res = match self {
             AssistantTool::WikiSearch => "wiki_search",
             AssistantTool::WebSearch => "web_search",
-            AssistantTool::GetDateTime => "get_datetime",
-            AssistantTool::GetDirectoryTree => "get_dirtree",
-            AssistantTool::GetFileContents => "get_file",
-            //HACK: Handle this cleanly, if the model hallucinates we crash :^)
-            AssistantTool::InvalidTool => todo!(),
+            AssistantTool::GetDateTime => "get_date_time",
+            AssistantTool::GetDirectoryTree => "get_dir_tree",
+            AssistantTool::GetFileContents => "get_file_contents",
+            AssistantTool::InvalidTool => "invalid_tool",
         };
         write!(f, "{}", res)
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "lowercase")]
 pub enum Action {
-    ChatMessage,
+    Chat,
     Tool(AssistantTool),
 }
 
 impl Display for Action {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
-            Action::ChatMessage => write!(f, "{}", "chat"),
+            Action::Chat => write!(f, "{}", "chat"),
             Action::Tool(tool_name) => write!(f, "{tool_name}"),
         }
     }
@@ -152,16 +154,13 @@ impl Display for Action {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct ActionPacket {
-    pub action: String,
+    pub action: Action,
     pub arguments: HashMap<String, String>,
 }
 
 impl ActionPacket {
     pub fn new(action: Action, arguments: HashMap<String, String>) -> Self {
-        Self {
-            action: action.to_string(),
-            arguments,
-        }
+        Self { action, arguments }
     }
 }
 

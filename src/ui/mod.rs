@@ -5,7 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-pub fn chat_ui(f: &mut ratatui::Frame, app: &crate::App) {
+pub fn chat_ui(f: &mut ratatui::Frame, app: &crate::AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)

@@ -1,8 +1,9 @@
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::{sync::mpsc, task};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, Event as CEvent, EventStream, KeyCode, MouseButton,
+    self, DisableMouseCapture, EnableMouseCapture, Event, Event as CEvent, EventStream, KeyCode,
+    MouseButton,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -10,15 +11,11 @@ use crossterm::terminal::{
 
 use ratatui::{Frame, Terminal, backend::CrosstermBackend};
 
-use std::any;
 use std::borrow::Cow;
-use std::cell::OnceCell;
-use std::time::{Duration, Instant};
 
 use chat::{Action, Message};
 use clap::Parser;
 use futures_util::StreamExt;
-use reqwest::Client;
 
 mod chat;
 mod ui;
@@ -44,14 +41,27 @@ struct Args {
     nerd_stats: bool,
 }
 
-struct AppStateQueue(UnboundedReceiver<Msg>, UnboundedSender<Msg>);
+pub struct AppStateQueue {
+    tx: UnboundedSender<Msg>,
+    rx: UnboundedReceiver<Msg>,
+}
+
+impl From<(UnboundedSender<Msg>, UnboundedReceiver<Msg>)> for AppStateQueue {
+    fn from(value: (UnboundedSender<Msg>, UnboundedReceiver<Msg>)) -> Self {
+        AppStateQueue {
+            tx: value.0,
+            rx: value.1,
+        }
+    }
+}
+
 struct AppState {
     args: Args,
     event_queue: AppStateQueue,
     prompt: String,
     messages: Vec<Message>,
     waiting: bool,
-    system_prompt: String
+    system_prompt: String,
 }
 
 impl AppState {
@@ -68,10 +78,10 @@ impl AppState {
 6. Base claims strictly on provided data or tool results. If unsure, say so.
 7. Check your output; If you reach four consecutive newlines: *stop*"#;
 
-    pub fn default(args: Args, event_queue: AppStateQueue) -> AppState {
-         AppState {
+    pub fn default(args: Args) -> AppState {
+        AppState {
             args,
-            event_queue,
+            event_queue: AppStateQueue::from(mpsc::unbounded_channel::<Msg>()),
             prompt: String::new(),
             messages: vec![],
             waiting: false,
@@ -80,25 +90,31 @@ impl AppState {
     }
 
     pub fn get_system_prompt() -> String {
-        format!("{}\n{}\n\n{}\n",
+        format!(
+            "{}\n{}\n\n{}\n",
             AppState::HEADER_PROMPT,
             AppState::TOOLS_LIST,
-            AppState::RULES_PROMPT)
+            AppState::RULES_PROMPT
+        )
     }
 
-    pub fn handle_http_done(&mut self, result: Result<reqwest::Response, reqwest::Error>) -> anyhow::Result<()> {
+    pub fn handle_http_done(
+        &mut self,
+        result: Result<String, reqwest::Error>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
     pub fn handle_input(&mut self, ev: Event) -> anyhow::Result<()> {
         match ev {
-            Event::FocusGained =>  { /* do nothing */ },
-            Event::FocusLost =>  { /* do nothing */ },
+            Event::FocusGained => { /* do nothing */ }
+            Event::FocusLost => { /* do nothing */ }
             Event::Key(key_event) => {
                 match key_event.code {
-                    _ => { /* ignore keys */ },
                     KeyCode::Char(c) => self.prompt.push(c),
-                    KeyCode::Backspace => { let _ = self.prompt.pop(); },
+                    KeyCode::Backspace => {
+                        let _ = self.prompt.pop();
+                    }
                     KeyCode::Enter => {
                         //TODO: refactor to a parser function to take the contents of the app.prompt vec and do fancy stuff with it (like commands)
                         let message_args = args_builder! {
@@ -147,27 +163,28 @@ impl AppState {
                             }
                         }
                     }
+                    _ => { /* ignore all other keys */ }
                 }
             }
-            Event::Mouse(mouse_event) => { 
+            Event::Mouse(mouse_event) => {
                 match mouse_event.kind {
                     event::MouseEventKind::Up(MouseButton::Left) => {
                         // --- Kick off an HTTP worker as a proof-of-concept ----
-                            let tx = self.event_queue.0.clone();
-                            tokio::spawn(async move {
-                                let res: Result<String, reqwest::Error> = async {
-                                    let resp = reqwest::get("https://ifconfig.me/all").await?;
-                                    resp.text().await
-                                }
-                                .await;
-                                let _ = tx.send(Msg::HttpDone(res));
-                            });
-                    },
-                    _ => {},
+                        let tx = self.event_queue.tx.clone();
+                        tokio::spawn(async move {
+                            let res: Result<String, reqwest::Error> = async {
+                                let resp = reqwest::get("https://ifconfig.me/all").await?;
+                                resp.text().await
+                            }
+                            .await;
+                            let _ = tx.send(Msg::HttpDone(res));
+                        });
+                    }
+                    _ => {}
                 }
-             },
-            Event::Paste(_) => { /* do nothing */ },
-            Event::Resize(_, _) => { /* do nothing */ },
+            }
+            Event::Paste(_) => { /* do nothing */ }
+            Event::Resize(_, _) => { /* do nothing */ }
         }
 
         Ok(())
@@ -191,10 +208,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // channel capacity 100 is plenty for a TUI
-    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
-
-
     // ---- UI LOOP ----------------------------------------------------------
     enable_raw_mode()?; // crossterm
     let mut stdout_handle = std::io::stdout();
@@ -205,28 +218,24 @@ async fn main() -> anyhow::Result<()> {
 
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(33));
-    let mut state = AppState::default(args, (tx, rx));
+    let mut state = AppState::default(args);
 
     'uiloop: loop {
         // first – non-blocking drain of all pending messages
-        while let Ok(msg) = state.rx.try_recv() {
+        'drain_event_loop: while let Ok(msg) = state.event_queue.rx.try_recv() {
             match msg {
-                Msg::Input(ev) => {
-                    match ev.as_key_event() {
-                        Some(ke) => {
-                            match ke.code {
-                                _ => state.handle_input(ev),
-                                KeyCode::Esc => {
-                                    term_cleanup(&mut terminal);
-                                    Ok(())
-                                }
-                            }
-                        },
-                        None => {},
+                Msg::Input(ev) => match ev.as_key_event() {
+                    Some(ke) => {
+                        if ke.code == KeyCode::Esc {
+                            term_cleanup(&mut terminal)?;
+                            return Ok(());
+                        } else {
+                            state.handle_input(ev)?
+                        }
                     }
-                    
-                 },
-                Msg::HttpDone(r) => state.handle_http_done(r),
+                    None => break 'drain_event_loop,
+                },
+                Msg::HttpDone(r) => state.handle_http_done(r)?,
             };
         }
 
@@ -239,7 +248,7 @@ async fn main() -> anyhow::Result<()> {
 
             maybe_ev = events.next() => {
                 if let Some(Ok(ev)) = maybe_ev {
-                    if tx.send(Msg::Input(ev)).is_err() { break 'uiloop }
+                    if state.event_queue.tx.send(Msg::Input(ev)).is_err() { break 'uiloop }
                 }
             }
         }

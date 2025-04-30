@@ -1,7 +1,8 @@
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::{sync::mpsc, task};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, EventStream, Event as CEvent, KeyCode,
+    self, DisableMouseCapture, EnableMouseCapture, Event, Event as CEvent, EventStream, KeyCode, MouseButton,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -9,16 +10,15 @@ use crossterm::terminal::{
 
 use ratatui::{Frame, Terminal, backend::CrosstermBackend};
 
+use std::any;
 use std::borrow::Cow;
-use std::pin::Pin;
+use std::cell::OnceCell;
 use std::time::{Duration, Instant};
 
 use chat::{Action, Message};
 use clap::Parser;
 use futures_util::StreamExt;
 use reqwest::Client;
-
-use futures_util::stream::StreamExt;
 
 mod chat;
 mod ui;
@@ -44,15 +44,134 @@ struct Args {
     nerd_stats: bool,
 }
 
+struct AppStateQueue(UnboundedReceiver<Msg>, UnboundedSender<Msg>);
 struct AppState {
     args: Args,
+    event_queue: AppStateQueue,
     prompt: String,
     messages: Vec<Message>,
     waiting: bool,
+    system_prompt: String
 }
 
 impl AppState {
-    
+    const HEADER_PROMPT: &str = r#"SYSTEM: You are "OxiAI", a logical, personal assistant that answers *only* via valid, minified, UTF-8 JSON."#;
+
+    const TOOLS_LIST: &str = include_str!("data/tools_list.json");
+
+    const RULES_PROMPT: &str = r#"Rules:
+1. Think silently, Never reveal your chain-of-thought.
+2. To use a tool: {"action":"<tool>","arguments":{...}}
+3. To reply directly: {"action":"chat","arguments":{"response":"..."}
+4. If a question is vague, comparative, descriptive, or about ideas rather than specifics: use the web_search tool.
+5. If a question clearly names a specific object, animal, person, place: use the wiki_search tool.
+6. Base claims strictly on provided data or tool results. If unsure, say so.
+7. Check your output; If you reach four consecutive newlines: *stop*"#;
+
+    pub fn default(args: Args, event_queue: AppStateQueue) -> AppState {
+         AppState {
+            args,
+            event_queue,
+            prompt: String::new(),
+            messages: vec![],
+            waiting: false,
+            system_prompt: AppState::get_system_prompt(),
+        }
+    }
+
+    pub fn get_system_prompt() -> String {
+        format!("{}\n{}\n\n{}\n",
+            AppState::HEADER_PROMPT,
+            AppState::TOOLS_LIST,
+            AppState::RULES_PROMPT)
+    }
+
+    pub fn handle_http_done(&mut self, result: Result<reqwest::Response, reqwest::Error>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    pub fn handle_input(&mut self, ev: Event) -> anyhow::Result<()> {
+        match ev {
+            Event::FocusGained =>  { /* do nothing */ },
+            Event::FocusLost =>  { /* do nothing */ },
+            Event::Key(key_event) => {
+                match key_event.code {
+                    _ => { /* ignore keys */ },
+                    KeyCode::Char(c) => self.prompt.push(c),
+                    KeyCode::Backspace => { let _ = self.prompt.pop(); },
+                    KeyCode::Enter => {
+                        //TODO: refactor to a parser function to take the contents of the app.prompt vec and do fancy stuff with it (like commands)
+                        let message_args = args_builder! {
+                            "response" => self.prompt.clone(),
+                        };
+                        self.prompt.clear();
+
+                        self.messages.push(chat::Message::new(
+                            chat::MessageRoles::User,
+                            chat::Action::Chat,
+                            message_args,
+                        ));
+
+                        let mut prompts = vec![chat::Prompt {
+                            role: Cow::Borrowed("system"),
+                            content: Cow::Borrowed(&self.system_prompt),
+                        }];
+                        prompts.extend(
+                            self.messages
+                                .iter()
+                                .map(|msg| chat::Prompt::from(msg.clone())),
+                        );
+
+                        let req = chat::ChatRequest {
+                            model: &self.args.model.clone(),
+                            stream: self.args.stream,
+                            format: "json",
+                            stop: vec!["\n\n\n\n"],
+                            options: Some(chat::ChatOptions {
+                                temperature: Some(0.3),
+                                top_p: Some(0.92),
+                                top_k: Some(50),
+                                repeat_penalty: Some(1.1),
+                                seed: None,
+                            }),
+                            messages: prompts,
+                        };
+
+                        self.waiting = true;
+                        match self.args.stream {
+                            true => {
+                                todo!();
+                            }
+                            false => {
+                                todo!();
+                            }
+                        }
+                    }
+                }
+            }
+            Event::Mouse(mouse_event) => { 
+                match mouse_event.kind {
+                    event::MouseEventKind::Up(MouseButton::Left) => {
+                        // --- Kick off an HTTP worker as a proof-of-concept ----
+                            let tx = self.event_queue.0.clone();
+                            tokio::spawn(async move {
+                                let res: Result<String, reqwest::Error> = async {
+                                    let resp = reqwest::get("https://ifconfig.me/all").await?;
+                                    resp.text().await
+                                }
+                                .await;
+                                let _ = tx.send(Msg::HttpDone(res));
+                            });
+                    },
+                    _ => {},
+                }
+             },
+            Event::Paste(_) => { /* do nothing */ },
+            Event::Resize(_, _) => { /* do nothing */ },
+        }
+
+        Ok(())
+    }
 }
 
 /// Messages that can arrive in the UI loop
@@ -75,20 +194,6 @@ async fn main() -> anyhow::Result<()> {
     // channel capacity 100 is plenty for a TUI
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
 
-    // --- Kick off an HTTP worker as a proof-of-concept ----
-    {
-        let tx = tx.clone();
-
-        tokio::spawn(async move {
-
-            let res: Result<String, reqwest::Error> = async {
-                let resp = reqwest::get("https://ifconfig.me/all.json").await?;
-                resp.text().await
-            }.await;
-            let _ = tx.send(Msg::HttpDone(res));
-
-        });
-    }
 
     // ---- UI LOOP ----------------------------------------------------------
     enable_raw_mode()?; // crossterm
@@ -99,50 +204,30 @@ async fn main() -> anyhow::Result<()> {
     terminal.clear()?;
 
     let mut events = EventStream::new();
-    // fixed-rate tick for animations
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(33));
+    let mut state = AppState::default(args, (tx, rx));
 
-    let header_prompt = r#"SYSTEM: You are "OxiAI", a logical, personal assistant that answers *only* via valid, minified, UTF-8 JSON."#;
-
-    let tools_list = include_str!("data/tools_list.json")
-        .parse::<serde_json::Value>()?
-        .to_string();
-
-    let rules_prompt = r#"Rules:
-1. Think silently, Never reveal your chain-of-thought.
-2. To use a tool: {"action":"<tool>","arguments":{...}}
-3. To reply directly: {"action":"chat","arguments":{"response":"..."}
-4. If a question is vague, comparative, descriptive, or about ideas rather than specifics: use the web_search tool.
-5. If a question clearly names a specific object, animal, person, place: use the wiki_search tool.
-6. Base claims strictly on provided data or tool results. If unsure, say so.
-7. Check your output; If you reach four consecutive newlines: *stop*"#;
-
-    let system_prompt = format!(
-        "{header_prompt}\n
-        {tools_list}\n\n
-        {rules_prompt}\n"
-    );
-
-    let mut state = AppState  {
-        args,
-        prompt: String::new(),
-        messages: vec![],
-        waiting: false,
-    };
-
-    loop {
+    'uiloop: loop {
         // first – non-blocking drain of all pending messages
-        while let Ok(Some(msg)) = rx.try_recv() {
+        while let Ok(msg) = state.rx.try_recv() {
             match msg {
                 Msg::Input(ev) => {
-                    if matches!(ev, CEvent::Key(k) if k.code == KeyCode::Char('q')) {
-                        cleanup(&mut terminal)?;
-                        return Ok(());
+                    match ev.as_key_event() {
+                        Some(ke) => {
+                            match ke.code {
+                                _ => state.handle_input(ev),
+                                KeyCode::Esc => {
+                                    term_cleanup(&mut terminal);
+                                    Ok(())
+                                }
+                            }
+                        },
+                        None => {},
                     }
-                    state.handle_input(ev);
-                }
-                Msg::HttpDone(r) => state.handle_http(r),
-            }
+                    
+                 },
+                Msg::HttpDone(r) => state.handle_http_done(r),
+            };
         }
 
         // draw a new frame
@@ -154,146 +239,25 @@ async fn main() -> anyhow::Result<()> {
 
             maybe_ev = events.next() => {
                 if let Some(Ok(ev)) = maybe_ev {
-                    if tx.send(Msg::Input(ev)).is_err() { break }
-
-                    
+                    if tx.send(Msg::Input(ev)).is_err() { break 'uiloop }
                 }
             }
         }
     }
-}
-
-//FIXME: streaming replies are harder to work with for now, save this for the future
-async fn stream_ollama_response(
-    app: &mut App,
-    client: Client,
-    req: chat::ChatRequest<'_>,
-) -> anyhow::Result<()> {
-    let mut resp = client
-        .post("http://localhost:11434/api/chat")
-        .json(&req)
-        .send()
-        .await?
-        .bytes_stream();
-
-    //TODO: since we haven't decoded the Steam we don't know if its sent the role part of the message
-    // we'll need to figure out how to 'see the future' so to speak
-    let mut assistant_line = String::from("Assistant : ");
-
-    while let Some(chunk) = resp.next().await {
-        let chunk = chunk?;
-        for line in chunk.split(|b| *b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            let parsed: serde_json::Result<chat::StreamChunk> = serde_json::from_slice(line);
-            if let Ok(parsed) = parsed {
-                assistant_line.push_str(&parsed.message.content.to_string());
-            }
-        }
-    }
-
-    //FIXME: fix this later
-    //app.messages.push(assistant_line);
 
     Ok(())
 }
 
-async fn batch_ollama_response<'a>(
-    app: &mut App,
-    client: Client,
-    req: chat::ChatRequest<'a>,
+fn term_cleanup<B: ratatui::backend::Backend + std::io::Write>(
+    terminal: &mut Terminal<B>,
 ) -> anyhow::Result<()> {
-    batch_ollama_response_inner(app, client, req).await
-}
+    disable_raw_mode()?;
+    crossterm::execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
 
-fn batch_ollama_response_inner<'a>(
-    app: &'a mut App,
-    client: Client,
-    req: chat::ChatRequest<'a>,
-) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
-    Box::pin(async move {
-        let start = Instant::now();
-        let resp = client
-            .post("http://localhost:11434/api/chat")
-            .json(&req)
-            .send()
-            .await?;
-        let elapsed = start.elapsed();
-
-        let status = resp.status();
-        let headers = resp.headers().clone();
-        let body_bytes = resp.bytes().await?;
-
-        match serde_json::from_slice::<chat::ChatResponse>(&body_bytes) {
-            Ok(r) => {
-                match r.message.content.action {
-                    chat::Action::Chat => app.messages.push(r.message),
-                    chat::Action::Tool(assistant_tool) => {
-                        match assistant_tool {
-                            chat::AssistantTool::WikiSearch => {
-                                //HACK: fake it for now, until I figure out how to grab a web page and display it in a way the model understands
-                                let tool_args = r.message.content.arguments.clone();
-                                app.messages.push(r.message);
-
-                                let search_term = match tool_args.get("query") {
-                                    Some(v) => v.as_str(),
-                                    None => todo!(),
-                                };
-
-                                let tool_response = match search_term {
-                                    "American Crow" => {
-                                        let r = args_builder! {
-                                            "result" => include_str!("data/american_crow_wikipedia.md")
-                                        };
-                                        r
-                                    }
-                                    "Black Bear" => {
-                                        let r = args_builder! {
-                                            "result" => include_str!("data/black_bear_wikipedia.md")
-                                        };
-                                        r
-                                    }
-                                    _ => {
-                                        let r = args_builder! {
-                                            "result" => "Search failed to return any valid data"
-                                        };
-                                        r
-                                    }
-                                };
-
-                                let tool_message = Message::from((
-                                    chat::MessageRoles::Tool,
-                                    Action::Tool(chat::AssistantTool::WikiSearch),
-                                    tool_response,
-                                ));
-                                app.messages.push(tool_message);
-                                //FIXME: model could recurse forever
-                                batch_ollama_response(app, client.clone(), req).await?;
-                            }
-                            chat::AssistantTool::WebSearch => todo!(),
-                            chat::AssistantTool::GetDateTime => todo!(),
-                            chat::AssistantTool::GetDirectoryTree => todo!(),
-                            chat::AssistantTool::GetFileContents => todo!(),
-                            chat::AssistantTool::InvalidTool => todo!(),
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                println!("Failed to parse JSON: {}", e);
-                println!("Status: {}", status);
-                println!("Headers: {:#?}", headers);
-                // Try to print the body as text for debugging
-                if let Ok(body_text) = std::str::from_utf8(&body_bytes) {
-                    println!("Body text: {}", body_text);
-                } else {
-                    println!("Body was not valid UTF-8");
-                }
-            }
-        }
-
-        app.waiting = false;
-        Ok(())
-    })
+    Ok(())
 }

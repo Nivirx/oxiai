@@ -21,7 +21,7 @@
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "Search DuckDuckGo (a web search engine)",
+                "description": "Search the web using DuckDuckGo (a web search engine)",
                 "parameters": {
                     "type": "object",
                     "properties": {

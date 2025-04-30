@@ -5,28 +5,17 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
-#[derive(Deserialize, Debug)]
-pub struct StreamChunk {
-    pub message: StreamMessage,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct StreamMessage {
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Prompt {
     pub role: String,
     pub content: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Prompt<'a> {
-    pub role: Cow<'a, str>,
-    pub content: Cow<'a, str>,
-}
-
-impl<'a> From<Message> for Prompt<'a> {
+impl<'a> From<Message> for Prompt {
     fn from(message: Message) -> Self {
         Prompt {
-            role: Cow::Owned(message.role),
-            content: Cow::Owned(message.content.to_string()),
+            role: message.role,
+            content: message.content.to_string(),
         }
     }
 }
@@ -41,12 +30,12 @@ pub struct ChatOptions {
 }
 
 #[derive(Serialize, Debug)]
-pub struct ChatRequest<'a> {
-    pub model: &'a str,
-    pub messages: Vec<Prompt<'a>>,
+pub struct ChatRequest {
+    pub model: String,
+    pub messages: Vec<Prompt>,
     pub stream: bool,
-    pub format: &'a str,
-    pub stop: Vec<&'a str>,
+    pub format: String,
+    pub stop: Vec<String>,
     pub options: Option<ChatOptions>,
 }
 

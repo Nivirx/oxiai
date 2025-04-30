@@ -1,3 +1,5 @@
+use crossterm::terminal;
+use ratatui::CompletedFrame;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -5,11 +7,9 @@ use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, Event as CEvent, EventStream, KeyCode,
     MouseButton,
 };
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
 
 use ratatui::{Frame, Terminal, backend::CrosstermBackend};
+use ui::OxiTerminal;
 
 use std::borrow::Cow;
 
@@ -41,23 +41,30 @@ struct Args {
     nerd_stats: bool,
 }
 
-pub struct AppStateQueue {
-    tx: UnboundedSender<Msg>,
-    rx: UnboundedReceiver<Msg>,
+pub struct Queues {
+    pub tx_msg: mpsc::UnboundedSender<Msg>, // worker → UI   (already exists)
+    pub rx_msg: mpsc::UnboundedReceiver<Msg>,
+
+    pub tx_cmd: mpsc::UnboundedSender<Cmd>, // UI → worker   (NEW)
+    pub rx_cmd: mpsc::UnboundedReceiver<Cmd>,
 }
 
-impl From<(UnboundedSender<Msg>, UnboundedReceiver<Msg>)> for AppStateQueue {
-    fn from(value: (UnboundedSender<Msg>, UnboundedReceiver<Msg>)) -> Self {
-        AppStateQueue {
-            tx: value.0,
-            rx: value.1,
+impl Queues {
+    pub fn new() -> Self {
+        let (tx_msg, rx_msg) = mpsc::unbounded_channel();
+        let (tx_cmd, rx_cmd) = mpsc::unbounded_channel();
+        Queues {
+            tx_msg,
+            rx_msg,
+            tx_cmd,
+            rx_cmd,
         }
     }
 }
 
 struct AppState {
     args: Args,
-    event_queue: AppStateQueue,
+    queues: Queues,
     prompt: String,
     messages: Vec<Message>,
     waiting: bool,
@@ -65,7 +72,7 @@ struct AppState {
 }
 
 impl AppState {
-    const HEADER_PROMPT: &str = r#"SYSTEM: You are "OxiAI", a logical, personal assistant that answers *only* via valid, minified, UTF-8 JSON."#;
+    const HEADER_PROMPT: &str = r#"SYSTEM: You are "OxiAI", A personal assistant with access to tools. You answer *only* via valid, UTF-8 JSON."#;
 
     const TOOLS_LIST: &str = include_str!("data/tools_list.json");
 
@@ -74,14 +81,14 @@ impl AppState {
 2. To use a tool: {"action":"<tool>","arguments":{...}}
 3. To reply directly: {"action":"chat","arguments":{"response":"..."}
 4. If a question is vague, comparative, descriptive, or about ideas rather than specifics: use the web_search tool.
-5. If a question clearly names a specific object, animal, person, place: use the wiki_search tool.
+5. If a question clearly names a specific entity, place, or period of time: use the wiki_search tool.
 6. Base claims strictly on provided data or tool results. If unsure, say so.
 7. Check your output; If you reach four consecutive newlines: *stop*"#;
 
     pub fn default(args: Args) -> AppState {
         AppState {
             args,
-            event_queue: AppStateQueue::from(mpsc::unbounded_channel::<Msg>()),
+            queues: Queues::new(),
             prompt: String::new(),
             messages: vec![],
             waiting: false,
@@ -105,7 +112,7 @@ impl AppState {
         Ok(())
     }
 
-    pub fn handle_input(&mut self, ev: Event) -> anyhow::Result<()> {
+    pub fn handle_input(&mut self, ev: Event) -> anyhow::Result<Option<Cmd>> {
         match ev {
             Event::FocusGained => { /* do nothing */ }
             Event::FocusLost => { /* do nothing */ }
@@ -129,8 +136,8 @@ impl AppState {
                         ));
 
                         let mut prompts = vec![chat::Prompt {
-                            role: Cow::Borrowed("system"),
-                            content: Cow::Borrowed(&self.system_prompt),
+                            role: "system".to_string(),
+                            content: self.system_prompt.clone(),
                         }];
                         prompts.extend(
                             self.messages
@@ -139,10 +146,10 @@ impl AppState {
                         );
 
                         let req = chat::ChatRequest {
-                            model: &self.args.model.clone(),
+                            model: self.args.model.clone(),
                             stream: self.args.stream,
-                            format: "json",
-                            stop: vec!["\n\n\n\n"],
+                            format: "json".to_string(),
+                            stop: vec!["\n\n\n\n".to_string()],
                             options: Some(chat::ChatOptions {
                                 temperature: Some(0.3),
                                 top_p: Some(0.92),
@@ -154,41 +161,28 @@ impl AppState {
                         };
 
                         self.waiting = true;
-                        match self.args.stream {
-                            true => {
-                                todo!();
-                            }
-                            false => {
-                                todo!();
-                            }
-                        }
+                        return Ok(Some(Cmd::RunChat { req }));
                     }
                     _ => { /* ignore all other keys */ }
                 }
             }
-            Event::Mouse(mouse_event) => {
-                match mouse_event.kind {
-                    event::MouseEventKind::Up(MouseButton::Left) => {
-                        // --- Kick off an HTTP worker as a proof-of-concept ----
-                        let tx = self.event_queue.tx.clone();
-                        tokio::spawn(async move {
-                            let res: Result<String, reqwest::Error> = async {
-                                let resp = reqwest::get("https://ifconfig.me/all").await?;
-                                resp.text().await
-                            }
-                            .await;
-                            let _ = tx.send(Msg::HttpDone(res));
-                        });
-                    }
-                    _ => {}
-                }
-            }
+            Event::Mouse(mouse_event) => match mouse_event.kind {
+                event::MouseEventKind::Up(MouseButton::Left) => {}
+                _ => {}
+            },
             Event::Paste(_) => { /* do nothing */ }
             Event::Resize(_, _) => { /* do nothing */ }
         }
 
-        Ok(())
+        Ok(None)
     }
+}
+
+/// Cmds that can arrive in the command event queue
+enum Cmd {
+    RunChat { req: chat::ChatRequest },
+    GetAddr,
+    Quit,
 }
 
 /// Messages that can arrive in the UI loop
@@ -199,7 +193,7 @@ enum Msg {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // parse arguments
+    // parse arguments from Clap
     let args = match Args::try_parse() {
         Ok(args) => args,
         Err(e) => {
@@ -208,47 +202,42 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // ---- UI LOOP ----------------------------------------------------------
-    enable_raw_mode()?; // crossterm
-    let mut stdout_handle = std::io::stdout();
-    crossterm::execute!(stdout_handle, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout_handle);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
+    // UI Event Loop
 
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(33));
+    let mut terminal = OxiTerminal::setup();
     let mut state = AppState::default(args);
 
     'uiloop: loop {
         // first – non-blocking drain of all pending messages
-        'drain_event_loop: while let Ok(msg) = state.event_queue.rx.try_recv() {
+        while let Ok(msg) = state.queues.rx_msg.try_recv() {
             match msg {
                 Msg::Input(ev) => match ev.as_key_event() {
                     Some(ke) => {
                         if ke.code == KeyCode::Esc {
-                            term_cleanup(&mut terminal)?;
-                            return Ok(());
+                            return terminal.term_cleanup();
                         } else {
-                            state.handle_input(ev)?
+                            if let Some(cmd) = state.handle_input(ev)? {
+                                if state.queues.tx_cmd.send(cmd).is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
-                    None => break 'drain_event_loop,
+                    None => {}
                 },
                 Msg::HttpDone(r) => state.handle_http_done(r)?,
             };
         }
 
-        // draw a new frame
-        terminal.draw(|f| ui::chat_ui(f, &state))?;
-
         // block until either next tick or next user input
         tokio::select! {
-            _ = ticker.tick() => { /* redraw ui per tick rate */},
+            _ = ticker.tick() => { terminal.do_draw(&state); },
 
             maybe_ev = events.next() => {
                 if let Some(Ok(ev)) = maybe_ev {
-                    if state.event_queue.tx.send(Msg::Input(ev)).is_err() { break 'uiloop }
+                    if state.queues.tx_msg.send(Msg::Input(ev)).is_err() { break 'uiloop }
                 }
             }
         }
@@ -257,16 +246,44 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn term_cleanup<B: ratatui::backend::Backend + std::io::Write>(
-    terminal: &mut Terminal<B>,
-) -> anyhow::Result<()> {
-    disable_raw_mode()?;
-    crossterm::execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+async fn run_workers(
+    mut rx_cmd: mpsc::UnboundedReceiver<Cmd>,
+    tx_msg: mpsc::UnboundedSender<Msg>,
+    model: String,
+) {
+    while let Some(cmd) = rx_cmd.recv().await {
+        match cmd {
+            Cmd::RunChat { req } => {
+                let tx_msg = tx_msg.clone();
+                tokio::spawn(async move {
+                    let res = ollama_call(req).await; // see next section
+                    let _ = tx_msg.send(Msg::HttpDone(res));
+                });
+            }
+            Cmd::GetAddr => {
+                // --- Kick off an HTTP worker as a proof-of-concept ----
+                let tx_msg = tx_msg.clone();
+                tokio::spawn(async move {
+                    let res: Result<String, reqwest::Error> = async {
+                        let resp = reqwest::get("https://ifconfig.me/all").await?;
+                        resp.text().await
+                    }
+                    .await;
+                    let _ = tx_msg.send(Msg::HttpDone(res));
+                });
+            }
+            Cmd::Quit => break,
+        }
+    }
+}
 
-    Ok(())
+async fn ollama_call(req: chat::ChatRequest) -> Result<String, reqwest::Error> {
+    let client = reqwest::Client::new();
+    client
+        .post("http://localhost:11434/api/chat")
+        .json(&req)
+        .send()
+        .await?
+        .text()
+        .await
 }
